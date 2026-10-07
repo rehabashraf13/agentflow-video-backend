@@ -37,6 +37,8 @@ class VideoRequest(BaseModel):
     idea: str
 
 
+class VideoGenerationRequest(BaseModel):
+    prompt: str
 @app.get("/")
 def home():
     return {
@@ -302,3 +304,88 @@ CAMERA AGENT:
 
         "final_prompt": final_prompt
     }
+
+
+from fastapi.responses import Response
+
+
+HF_TOKEN = os.getenv("HF_TOKEN")
+
+HF_VIDEO_MODEL = os.getenv(
+    "HF_VIDEO_MODEL",
+    "Wan-AI/Wan2.2-TI2V-5B"
+)
+
+
+@app.post("/generate-video")
+async def generate_video(request: VideoGenerationRequest):
+
+    prompt = request.prompt.strip()
+
+    if not prompt:
+        raise HTTPException(
+            status_code=400,
+            detail="Video prompt cannot be empty."
+        )
+
+    if not HF_TOKEN:
+        raise HTTPException(
+            status_code=500,
+            detail="HF_TOKEN is not configured."
+        )
+
+    url = (
+        "https://router.huggingface.co/"
+        f"hf-inference/models/{HF_VIDEO_MODEL}"
+    )
+
+    headers = {
+        "Authorization": f"Bearer {HF_TOKEN}"
+    }
+
+    payload = {
+        "inputs": prompt,
+        "parameters": {
+            "num_frames": 81,
+            "num_inference_steps": 20,
+            "guidance_scale": 5.0
+        }
+    }
+
+    try:
+
+        async with httpx.AsyncClient(
+            timeout=300.0
+        ) as client:
+
+            response = await client.post(
+                url,
+                headers=headers,
+                json=payload
+            )
+
+        if response.status_code != 200:
+
+            raise HTTPException(
+                status_code=response.status_code,
+                detail=f"Hugging Face error: {response.text}"
+            )
+
+        return Response(
+            content=response.content,
+            media_type="video/mp4",
+            headers={
+                "Content-Disposition":
+                'inline; filename="agentflow-video.mp4"'
+            }
+        )
+
+    except HTTPException:
+        raise
+
+    except Exception as e:
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"Video generation error: {str(e)}"
+        )
