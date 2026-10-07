@@ -15,7 +15,7 @@ from gradio_client import Client
 
 app = FastAPI(
     title="AgentFlow Video API",
-    version="4.0.0"
+    version="4.1.0"
 )
 
 app.add_middleware(
@@ -66,7 +66,7 @@ def home():
     return {
         "status": "online",
         "project": "AgentFlow Video",
-        "version": "4.0.0",
+        "version": "4.1.0",
         "video_backend": "Hugging Face ZeroGPU"
     }
 
@@ -85,11 +85,14 @@ def health():
 
 # =========================================================
 # GROQ AGENT FUNCTION
+# WITH EMPTY-OUTPUT VALIDATION + RETRY
 # =========================================================
 
 async def call_agent(
     system_prompt: str,
-    user_prompt: str
+    user_prompt: str,
+    agent_name: str,
+    max_retries: int = 3
 ) -> str:
 
     if not GROQ_API_KEY:
@@ -103,55 +106,155 @@ async def call_agent(
         "Content-Type": "application/json"
     }
 
-    payload = {
-        "model": GROQ_MODEL,
-        "temperature": 0.7,
-        "max_tokens": 350,
-        "messages": [
-            {
-                "role": "system",
-                "content": system_prompt
-            },
-            {
-                "role": "user",
-                "content": user_prompt
-            }
-        ]
-    }
+    last_error = None
 
-    try:
+    for attempt in range(1, max_retries + 1):
 
-        async with httpx.AsyncClient(
-            timeout=60.0
-        ) as client:
+        payload = {
+            "model": GROQ_MODEL,
 
-            response = await client.post(
-                GROQ_URL,
-                headers=headers,
-                json=payload
+            # Slightly lower temperature gives us
+            # more stable production output.
+            "temperature": 0.6,
+
+            # Give Director / Camera / Prompt Agent
+            # enough room to finish their response.
+            "max_tokens": 600,
+
+            "messages": [
+                {
+                    "role": "system",
+                    "content": system_prompt
+                },
+                {
+                    "role": "user",
+                    "content": user_prompt
+                }
+            ]
+        }
+
+        try:
+
+            async with httpx.AsyncClient(
+                timeout=90.0
+            ) as client:
+
+                response = await client.post(
+                    GROQ_URL,
+                    headers=headers,
+                    json=payload
+                )
+
+
+            if response.status_code != 200:
+
+                last_error = (
+                    f"Groq API returned HTTP "
+                    f"{response.status_code}: "
+                    f"{response.text}"
+                )
+
+                # Retry temporary errors.
+                if attempt < max_retries:
+                    await asyncio.sleep(attempt)
+                    continue
+
+                raise HTTPException(
+                    status_code=502,
+                    detail=(
+                        f"{agent_name} failed after "
+                        f"{max_retries} attempts. "
+                        f"{last_error}"
+                    )
+                )
+
+
+            data = response.json()
+
+
+            # =============================================
+            # SAFELY EXTRACT GROQ OUTPUT
+            # =============================================
+
+            try:
+
+                content = (
+                    data["choices"][0]["message"]
+                    .get("content")
+                )
+
+            except (
+                KeyError,
+                IndexError,
+                TypeError,
+                AttributeError
+            ):
+
+                content = None
+
+
+            # Convert None to empty string and strip
+            # whitespace before validation.
+
+            if content is None:
+                content = ""
+
+            if not isinstance(content, str):
+                content = str(content)
+
+            content = content.strip()
+
+
+            # =============================================
+            # VALIDATE OUTPUT
+            # =============================================
+
+            if content:
+
+                return content
+
+
+            # Groq returned HTTP 200 but no useful text.
+
+            last_error = (
+                f"{agent_name} returned an empty output "
+                f"on attempt {attempt}."
             )
 
-        if response.status_code != 200:
-            raise HTTPException(
-                status_code=502,
-                detail=f"Groq API error: {response.text}"
-            )
 
-        data = response.json()
+            if attempt < max_retries:
 
-        return (
-            data["choices"][0]["message"]["content"]
-            .strip()
+                await asyncio.sleep(attempt)
+
+                # Retry with the same agent instructions.
+                continue
+
+
+        except HTTPException:
+            raise
+
+
+        except Exception as e:
+
+            last_error = str(e)
+
+            if attempt < max_retries:
+
+                await asyncio.sleep(attempt)
+                continue
+
+
+    # If all attempts produced empty/invalid output,
+    # stop the pipeline here.
+
+    raise HTTPException(
+        status_code=502,
+        detail=(
+            f"{agent_name} failed to produce a valid "
+            f"response after {max_retries} attempts. "
+            f"Last error: {last_error}"
         )
-
-    except HTTPException:
-        raise
-
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Agent error: {str(e)}"
-        )
+    )
 
 
 # =========================================================
@@ -163,13 +266,17 @@ async def generate_prompt(request: VideoRequest):
 
     idea = request.idea.strip()
 
+
     if not idea:
+
         raise HTTPException(
             status_code=400,
             detail="Video idea cannot be empty."
         )
 
+
     if len(idea) > 500:
+
         raise HTTPException(
             status_code=400,
             detail="Video idea is too long."
@@ -181,7 +288,7 @@ async def generate_prompt(request: VideoRequest):
     # =====================================================
 
     script = await call_agent(
-        """
+        system_prompt="""
 You are the Script Agent in an AI filmmaking system.
 
 Convert the user's idea into ONE visually clear scene
@@ -198,9 +305,15 @@ Do not write dialogue.
 Do not create multiple scenes.
 Do not explain your reasoning.
 
+IMPORTANT:
+You must always return a non-empty scene description.
+
 Return only the short scene description.
 """,
-        idea
+
+        user_prompt=idea,
+
+        agent_name="Script Agent"
     )
 
 
@@ -209,7 +322,7 @@ Return only the short scene description.
     # =====================================================
 
     direction = await call_agent(
-        """
+        system_prompt="""
 You are the Director Agent in an AI filmmaking system.
 
 Transform the provided five-second scene into
@@ -228,15 +341,21 @@ Preserve the original action.
 Do not create another scene.
 Do not explain your reasoning.
 
+IMPORTANT:
+You must always return non-empty visual direction.
+
 Return only the visual direction.
 """,
-        f"""
+
+        user_prompt=f"""
 ORIGINAL IDEA:
 {idea}
 
 SCRIPT:
 {script}
-"""
+""",
+
+        agent_name="Director Agent"
     )
 
 
@@ -245,7 +364,7 @@ SCRIPT:
     # =====================================================
 
     camera = await call_agent(
-        """
+        system_prompt="""
 You are the Cinematography Agent in a professional
 AI filmmaking system.
 
@@ -267,15 +386,25 @@ Do not change the story.
 Do not add scene cuts.
 Do not explain your reasoning.
 
+IMPORTANT:
+You must always return non-empty cinematography
+instructions.
+
 Return only the cinematography instructions.
 """,
-        f"""
+
+        user_prompt=f"""
+ORIGINAL IDEA:
+{idea}
+
 SCENE:
 {script}
 
 DIRECTOR:
 {direction}
-"""
+""",
+
+        agent_name="Camera Agent"
     )
 
 
@@ -284,7 +413,7 @@ DIRECTOR:
     # =====================================================
 
     final_prompt = await call_agent(
-        """
+        system_prompt="""
 You are the final Prompt Engineer for an advanced
 AI text-to-video model.
 
@@ -320,12 +449,16 @@ Avoid:
 - deformed anatomy
 - unnecessary adjectives
 
+IMPORTANT:
+You MUST return a non-empty English video prompt.
+
 Return ONLY the final video prompt.
 
 Do not use headings.
 Do not explain your reasoning.
 """,
-        f"""
+
+        user_prompt=f"""
 ORIGINAL IDEA:
 {idea}
 
@@ -337,12 +470,30 @@ DIRECTOR AGENT:
 
 CAMERA AGENT:
 {camera}
-"""
+""",
+
+        agent_name="Prompt Agent"
     )
+
+
+    # =====================================================
+    # FINAL SAFETY VALIDATION
+    # =====================================================
+
+    if not final_prompt.strip():
+
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Prompt Agent completed but returned "
+                "an empty final prompt."
+            )
+        )
 
 
     return {
         "success": True,
+
         "idea": idea,
 
         "agents": {
@@ -378,29 +529,19 @@ CAMERA AGENT:
 
 def run_video_generation(prompt: str):
 
-    # Connect to the public Hugging Face ZeroGPU Space.
-    #
-    # HF_TOKEN allows the request to use the logged-in
-    # Hugging Face account quota.
-
     client = Client(
         ZEROGPU_SPACE,
         token=HF_TOKEN
     )
 
 
-    # The parameters below match the REAL /generate
-    # API schema returned by the Space.
-
     result = client.predict(
 
-        # Use the normal Wan base model.
+        # Safe/base Wan model.
         model_key="wan-base",
 
-        # Final prompt produced by our Prompt Agent.
         prompt=prompt,
 
-        # Things we want the model to avoid.
         negative_prompt=(
             "text, subtitles, captions, logos, watermarks, "
             "low quality, blurry image, JPEG artifacts, "
@@ -410,29 +551,25 @@ def run_video_generation(prompt: str):
             "inconsistent appearance, inconsistent motion"
         ),
 
-        # 16:9 landscape video.
         width=832,
+
         height=480,
 
-        # Valid value according to the Space schema (4n+1).
         num_frames=49,
 
-        # Generation quality settings.
         steps=30,
+
         guidance_scale=5.0,
 
-        # Random seed.
         seed=-1,
 
-        # Not relevant for wan-base,
-        # but required by the endpoint schema.
         lora_scale=1.0,
 
-        # No custom checkpoint.
         custom_ckpt="",
 
         api_name="/generate"
     )
+
 
     return result
 
@@ -450,6 +587,7 @@ async def generate_video(
 
 
     if not prompt:
+
         raise HTTPException(
             status_code=400,
             detail="Video prompt cannot be empty."
@@ -457,6 +595,7 @@ async def generate_video(
 
 
     if len(prompt) > 4000:
+
         raise HTTPException(
             status_code=400,
             detail="Video prompt is too long."
@@ -464,6 +603,7 @@ async def generate_video(
 
 
     if not HF_TOKEN:
+
         raise HTTPException(
             status_code=500,
             detail="HF_TOKEN is not configured."
@@ -472,8 +612,8 @@ async def generate_video(
 
     try:
 
-        # gradio_client is synchronous.
-        # Run it outside FastAPI's async event loop.
+        # Gradio Client is synchronous.
+        # Keep it outside FastAPI's event loop.
 
         result = await asyncio.to_thread(
             run_video_generation,
@@ -482,27 +622,20 @@ async def generate_video(
 
 
         if not result:
+
             raise RuntimeError(
                 "ZeroGPU returned an empty result."
             )
 
 
         # =================================================
-        # READ GRADIO RESPONSE
+        # EXTRACT VIDEO RESULT
         # =================================================
-        #
-        # According to the /generate API schema,
-        # the Space returns:
-        #
-        # 1. Video file
-        # 2. Seed used
-        # 3. Status message
-        #
-        # gradio_client normally returns these as a tuple.
 
         if isinstance(result, (list, tuple)):
 
             if len(result) == 0:
+
                 raise RuntimeError(
                     "ZeroGPU returned no output."
                 )
@@ -511,35 +644,25 @@ async def generate_video(
 
         else:
 
-            # Defensive fallback in case a future
-            # Gradio version returns only the file.
-
             video_result = result
 
 
         # =================================================
-        # GET LOCAL VIDEO PATH
+        # EXTRACT LOCAL VIDEO PATH
         # =================================================
 
         video_path = None
 
-
-        # Most common gradio_client response:
-        # a downloaded temporary filepath.
 
         if isinstance(video_result, str):
 
             video_path = video_result
 
 
-        # Some Gradio versions may return a dictionary.
-
         elif isinstance(video_result, dict):
 
             video_path = video_result.get("path")
 
-
-        # FileData-like object.
 
         elif hasattr(video_result, "path"):
 
@@ -556,12 +679,13 @@ async def generate_video(
         if not os.path.exists(video_path):
 
             raise RuntimeError(
-                f"Generated video file was not downloaded: {video_path}"
+                f"Generated video file was not downloaded: "
+                f"{video_path}"
             )
 
 
         # =================================================
-        # READ MP4
+        # READ GENERATED MP4
         # =================================================
 
         with open(video_path, "rb") as video_file:
@@ -577,12 +701,14 @@ async def generate_video(
 
 
         # =================================================
-        # RETURN MP4 TO OUR WEBSITE
+        # RETURN VIDEO TO FRONTEND
         # =================================================
 
         return Response(
             content=video_bytes,
+
             media_type="video/mp4",
+
             headers={
                 "Content-Disposition":
                     'inline; filename="agentflow-video.mp4"',
