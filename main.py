@@ -1,16 +1,21 @@
 import os
-import json
+import asyncio
 import httpx
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 from pydantic import BaseModel
 from huggingface_hub import InferenceClient
-from fastapi.responses import Response
+
+
+# =========================================================
+# APP
+# =========================================================
 
 app = FastAPI(
     title="AgentFlow Video API",
-    version="2.0.0"
+    version="3.0.0"
 )
 
 app.add_middleware(
@@ -22,17 +27,31 @@ app.add_middleware(
 )
 
 
+# =========================================================
+# ENVIRONMENT VARIABLES
+# =========================================================
+
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
-# If Groq changes/retire models later, this can be changed
-# from Render without modifying the source code.
 GROQ_MODEL = os.getenv(
     "GROQ_MODEL",
-    "llama-3.3-70b-versatile"
+    "openai/gpt-oss-120b"
 )
 
+
+HF_TOKEN = os.getenv("HF_TOKEN")
+
+HF_VIDEO_MODEL = os.getenv(
+    "HF_VIDEO_MODEL",
+    "Wan-AI/Wan2.2-TI2V-5B"
+)
+
+
+# =========================================================
+# REQUEST MODELS
+# =========================================================
 
 class VideoRequest(BaseModel):
     idea: str
@@ -40,12 +59,18 @@ class VideoRequest(BaseModel):
 
 class VideoGenerationRequest(BaseModel):
     prompt: str
+
+
+# =========================================================
+# BASIC ROUTES
+# =========================================================
+
 @app.get("/")
 def home():
     return {
         "status": "online",
         "project": "AgentFlow Video",
-        "version": "2.0.0"
+        "version": "3.0.0"
     }
 
 
@@ -53,11 +78,21 @@ def home():
 def health():
     return {
         "status": "healthy",
-        "groq_configured": bool(GROQ_API_KEY)
+        "groq_configured": bool(GROQ_API_KEY),
+        "huggingface_configured": bool(HF_TOKEN),
+        "groq_model": GROQ_MODEL,
+        "video_model": HF_VIDEO_MODEL
     }
 
 
-async def call_agent(system_prompt: str, user_prompt: str) -> str:
+# =========================================================
+# GROQ AGENT FUNCTION
+# =========================================================
+
+async def call_agent(
+    system_prompt: str,
+    user_prompt: str
+) -> str:
 
     if not GROQ_API_KEY:
         raise HTTPException(
@@ -88,7 +123,9 @@ async def call_agent(system_prompt: str, user_prompt: str) -> str:
 
     try:
 
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        async with httpx.AsyncClient(
+            timeout=60.0
+        ) as client:
 
             response = await client.post(
                 GROQ_URL,
@@ -104,7 +141,10 @@ async def call_agent(system_prompt: str, user_prompt: str) -> str:
 
         data = response.json()
 
-        return data["choices"][0]["message"]["content"].strip()
+        return (
+            data["choices"][0]["message"]["content"]
+            .strip()
+        )
 
     except HTTPException:
         raise
@@ -115,6 +155,10 @@ async def call_agent(system_prompt: str, user_prompt: str) -> str:
             detail=f"Agent error: {str(e)}"
         )
 
+
+# =========================================================
+# MULTI-AGENT PROMPT PIPELINE
+# =========================================================
 
 @app.post("/generate-prompt")
 async def generate_prompt(request: VideoRequest):
@@ -133,26 +177,27 @@ async def generate_prompt(request: VideoRequest):
             detail="Video idea is too long."
         )
 
-    # -------------------------
-    # AGENT 1 — SCRIPT WRITER
-    # -------------------------
+
+    # =====================================================
+    # AGENT 1 — SCRIPT
+    # =====================================================
 
     script = await call_agent(
         """
 You are the Script Agent in an AI filmmaking system.
 
-Convert the user's idea into ONE visually clear scene that can
-actually happen within exactly five seconds.
+Convert the user's idea into ONE visually clear scene
+that can happen within exactly five seconds.
 
 Focus on:
 - one main subject
 - one clear action
 - visual storytelling
 - physical movement
-- beginning and end of the 5-second shot
+- a clear beginning and ending
 
 Do not write dialogue.
-Do not write multiple scenes.
+Do not create multiple scenes.
 Do not explain your reasoning.
 
 Return only the short scene description.
@@ -160,16 +205,17 @@ Return only the short scene description.
         idea
     )
 
-    # -------------------------
+
+    # =====================================================
     # AGENT 2 — DIRECTOR
-    # -------------------------
+    # =====================================================
 
     direction = await call_agent(
         """
 You are the Director Agent in an AI filmmaking system.
 
-Take the five-second scene written by the Script Agent and create
-a concise visual direction.
+Transform the provided five-second scene into
+professional visual direction.
 
 Specify:
 - environment
@@ -180,23 +226,32 @@ Specify:
 - cinematic mood
 
 Preserve the original action.
-Do not add another scene.
+
+Do not create another scene.
 Do not explain your reasoning.
 
 Return only the visual direction.
 """,
-        script
+        f"""
+ORIGINAL IDEA:
+{idea}
+
+SCRIPT:
+{script}
+"""
     )
 
-    # -------------------------
+
+    # =====================================================
     # AGENT 3 — CINEMATOGRAPHER
-    # -------------------------
+    # =====================================================
 
     camera = await call_agent(
         """
-You are the Cinematography Agent for a professional AI video system.
+You are the Cinematography Agent in a professional
+AI filmmaking system.
 
-Design the camera treatment for the provided five-second scene.
+Design the cinematography for the provided scene.
 
 Specify:
 - shot type
@@ -207,9 +262,11 @@ Specify:
 - composition
 - motion characteristics
 
-The movement must be achievable in one continuous five-second shot.
+Everything must be achievable in ONE continuous
+five-second shot.
 
 Do not change the story.
+Do not add scene cuts.
 Do not explain your reasoning.
 
 Return only the cinematography instructions.
@@ -223,31 +280,38 @@ DIRECTOR:
 """
     )
 
-    # -------------------------
-    # AGENT 4 — VIDEO PROMPT
-    # -------------------------
+
+    # =====================================================
+    # AGENT 4 — PROMPT ENGINEER
+    # =====================================================
 
     final_prompt = await call_agent(
         """
-You are the final Prompt Engineer for a state-of-the-art
-text-to-video model.
+You are the final Prompt Engineer for an advanced
+AI text-to-video model.
 
-Combine the provided scene, direction and cinematography into
-ONE production-ready English video-generation prompt.
+Combine the supplied script, direction and
+cinematography into ONE production-ready
+English video-generation prompt.
 
 Requirements:
-- one continuous five-second shot
-- 16:9 cinematic composition
-- explicit subject and action
+
+- exactly one continuous five-second shot
+- cinematic 16:9 composition
+- explicit main subject
+- explicit physical action
 - environment
 - camera movement
 - lighting
+- depth
 - realistic temporal motion
 - coherent physics
+- consistent subject appearance
 - high visual detail
-- cinematic quality
+- professional cinematic quality
 
 Avoid:
+
 - multiple shots
 - scene cuts
 - text
@@ -255,11 +319,13 @@ Avoid:
 - logos
 - watermarks
 - duplicated subjects
+- deformed anatomy
 - unnecessary adjectives
 
 Return ONLY the final video prompt.
+
 Do not use headings.
-Do not explain anything.
+Do not explain your reasoning.
 """,
         f"""
 ORIGINAL IDEA:
@@ -275,6 +341,7 @@ CAMERA AGENT:
 {camera}
 """
     )
+
 
     return {
         "success": True,
@@ -307,19 +374,28 @@ CAMERA AGENT:
     }
 
 
-from fastapi.responses import Response
+# =========================================================
+# VIDEO AGENT
+# =========================================================
 
+def run_video_generation(prompt: str):
 
-HF_TOKEN = os.getenv("HF_TOKEN")
+    client = InferenceClient(
+        provider="fal-ai",
+        api_key=HF_TOKEN,
+        timeout=300
+    )
 
-HF_VIDEO_MODEL = os.getenv(
-    "HF_VIDEO_MODEL",
-    "Wan-AI/Wan2.2-TI2V-5B"
-)
+    return client.text_to_video(
+        prompt,
+        model=HF_VIDEO_MODEL
+    )
 
 
 @app.post("/generate-video")
-async def generate_video(request: VideoGenerationRequest):
+async def generate_video(
+    request: VideoGenerationRequest
+):
 
     prompt = request.prompt.strip()
 
@@ -329,60 +405,43 @@ async def generate_video(request: VideoGenerationRequest):
             detail="Video prompt cannot be empty."
         )
 
+    if len(prompt) > 4000:
+        raise HTTPException(
+            status_code=400,
+            detail="Video prompt is too long."
+        )
+
     if not HF_TOKEN:
         raise HTTPException(
             status_code=500,
             detail="HF_TOKEN is not configured."
         )
 
-    url = (
-        "https://router.huggingface.co/"
-        f"hf-inference/models/{HF_VIDEO_MODEL}"
-    )
-
-    headers = {
-        "Authorization": f"Bearer {HF_TOKEN}"
-    }
-
-    payload = {
-        "inputs": prompt,
-        "parameters": {
-            "num_frames": 81,
-            "num_inference_steps": 20,
-            "guidance_scale": 5.0
-        }
-    }
-
     try:
 
-        async with httpx.AsyncClient(
-            timeout=300.0
-        ) as client:
+        # InferenceClient is synchronous.
+        # Run it outside FastAPI's async event loop.
+        video = await asyncio.to_thread(
+            run_video_generation,
+            prompt
+        )
 
-            response = await client.post(
-                url,
-                headers=headers,
-                json=payload
-            )
-
-        if response.status_code != 200:
-
-            raise HTTPException(
-                status_code=response.status_code,
-                detail=f"Hugging Face error: {response.text}"
+        if not video:
+            raise RuntimeError(
+                "The video provider returned an empty response."
             )
 
         return Response(
-            content=response.content,
+            content=video,
             media_type="video/mp4",
             headers={
                 "Content-Disposition":
-                'inline; filename="agentflow-video.mp4"'
+                'inline; filename="agentflow-video.mp4"',
+
+                "Cache-Control":
+                "no-store"
             }
         )
-
-    except HTTPException:
-        raise
 
     except Exception as e:
 
