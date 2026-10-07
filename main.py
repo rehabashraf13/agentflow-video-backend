@@ -15,7 +15,7 @@ from gradio_client import Client
 
 app = FastAPI(
     title="AgentFlow Video API",
-    version="4.1.0"
+    version="4.2.0"
 )
 
 app.add_middleware(
@@ -66,7 +66,7 @@ def home():
     return {
         "status": "online",
         "project": "AgentFlow Video",
-        "version": "4.1.0",
+        "version": "4.2.0",
         "video_backend": "Hugging Face ZeroGPU"
     }
 
@@ -85,14 +85,15 @@ def health():
 
 # =========================================================
 # GROQ AGENT FUNCTION
-# WITH EMPTY-OUTPUT VALIDATION + RETRY
+# EMPTY + TRUNCATED OUTPUT RETRY
 # =========================================================
 
 async def call_agent(
     system_prompt: str,
     user_prompt: str,
     agent_name: str,
-    max_retries: int = 3
+    min_length: int = 40,
+    max_retries: int = 4
 ) -> str:
 
     if not GROQ_API_KEY:
@@ -110,21 +111,37 @@ async def call_agent(
 
     for attempt in range(1, max_retries + 1):
 
+        # Add an explicit retry instruction after
+        # an empty/truncated response.
+        retry_instruction = ""
+
+        if attempt > 1:
+            retry_instruction = f"""
+
+IMPORTANT RETRY INSTRUCTION:
+Your previous response was empty or incomplete.
+
+Return a COMPLETE response now.
+
+Do not stop mid-sentence.
+Do not return an empty response.
+The response must contain at least {min_length} characters.
+"""
+
         payload = {
             "model": GROQ_MODEL,
 
-            # Slightly lower temperature gives us
-            # more stable production output.
-            "temperature": 0.6,
+            "temperature": 0.55,
 
-            # Give Director / Camera / Prompt Agent
-            # enough room to finish their response.
-            "max_tokens": 600,
+            # More room for the reasoning model.
+            "max_tokens": 1000,
 
             "messages": [
                 {
                     "role": "system",
-                    "content": system_prompt
+                    "content":
+                        system_prompt +
+                        retry_instruction
                 },
                 {
                     "role": "user",
@@ -136,7 +153,7 @@ async def call_agent(
         try:
 
             async with httpx.AsyncClient(
-                timeout=90.0
+                timeout=120.0
             ) as client:
 
                 response = await client.post(
@@ -146,16 +163,19 @@ async def call_agent(
                 )
 
 
+            # =============================================
+            # HTTP ERROR
+            # =============================================
+
             if response.status_code != 200:
 
                 last_error = (
-                    f"Groq API returned HTTP "
-                    f"{response.status_code}: "
+                    f"Groq HTTP {response.status_code}: "
                     f"{response.text}"
                 )
 
-                # Retry temporary errors.
                 if attempt < max_retries:
+
                     await asyncio.sleep(attempt)
                     continue
 
@@ -169,18 +189,23 @@ async def call_agent(
                 )
 
 
+            # =============================================
+            # PARSE RESPONSE
+            # =============================================
+
             data = response.json()
 
 
-            # =============================================
-            # SAFELY EXTRACT GROQ OUTPUT
-            # =============================================
-
             try:
 
-                content = (
-                    data["choices"][0]["message"]
-                    .get("content")
+                choice = data["choices"][0]
+
+                message = choice.get("message", {})
+
+                content = message.get("content", "")
+
+                finish_reason = choice.get(
+                    "finish_reason"
                 )
 
             except (
@@ -190,11 +215,9 @@ async def call_agent(
                 AttributeError
             ):
 
-                content = None
+                content = ""
+                finish_reason = None
 
-
-            # Convert None to empty string and strip
-            # whitespace before validation.
 
             if content is None:
                 content = ""
@@ -206,28 +229,68 @@ async def call_agent(
 
 
             # =============================================
-            # VALIDATE OUTPUT
+            # VALIDATION 1 — EMPTY OUTPUT
             # =============================================
 
-            if content:
+            if not content:
 
-                return content
+                last_error = (
+                    f"{agent_name} returned empty output "
+                    f"on attempt {attempt}."
+                )
+
+                if attempt < max_retries:
+
+                    await asyncio.sleep(attempt)
+                    continue
+
+                break
 
 
-            # Groq returned HTTP 200 but no useful text.
+            # =============================================
+            # VALIDATION 2 — TOO SHORT / TRUNCATED
+            # =============================================
 
-            last_error = (
-                f"{agent_name} returned an empty output "
-                f"on attempt {attempt}."
-            )
+            if len(content) < min_length:
+
+                last_error = (
+                    f"{agent_name} returned only "
+                    f"{len(content)} characters "
+                    f"on attempt {attempt}."
+                )
+
+                if attempt < max_retries:
+
+                    await asyncio.sleep(attempt)
+                    continue
+
+                break
 
 
-            if attempt < max_retries:
+            # =============================================
+            # VALIDATION 3 — TOKEN LIMIT
+            # =============================================
 
-                await asyncio.sleep(attempt)
+            if finish_reason == "length":
 
-                # Retry with the same agent instructions.
-                continue
+                last_error = (
+                    f"{agent_name} response was truncated "
+                    f"because the token limit was reached."
+                )
+
+                if attempt < max_retries:
+
+                    await asyncio.sleep(attempt)
+                    continue
+
+                break
+
+
+            # =============================================
+            # SUCCESS
+            # =============================================
+
+            return content
 
 
         except HTTPException:
@@ -236,7 +299,9 @@ async def call_agent(
 
         except Exception as e:
 
-            last_error = str(e)
+            last_error = (
+                f"{agent_name} error: {str(e)}"
+            )
 
             if attempt < max_retries:
 
@@ -244,13 +309,14 @@ async def call_agent(
                 continue
 
 
-    # If all attempts produced empty/invalid output,
-    # stop the pipeline here.
+    # =============================================
+    # ALL RETRIES FAILED
+    # =============================================
 
     raise HTTPException(
         status_code=502,
         detail=(
-            f"{agent_name} failed to produce a valid "
+            f"{agent_name} failed to produce a complete "
             f"response after {max_retries} attempts. "
             f"Last error: {last_error}"
         )
@@ -262,7 +328,9 @@ async def call_agent(
 # =========================================================
 
 @app.post("/generate-prompt")
-async def generate_prompt(request: VideoRequest):
+async def generate_prompt(
+    request: VideoRequest
+):
 
     idea = request.idea.strip()
 
@@ -288,6 +356,7 @@ async def generate_prompt(request: VideoRequest):
     # =====================================================
 
     script = await call_agent(
+
         system_prompt="""
 You are the Script Agent in an AI filmmaking system.
 
@@ -295,6 +364,7 @@ Convert the user's idea into ONE visually clear scene
 that can happen within exactly five seconds.
 
 Focus on:
+
 - one main subject
 - one clear action
 - visual storytelling
@@ -302,18 +372,23 @@ Focus on:
 - a clear beginning and ending
 
 Do not write dialogue.
+
 Do not create multiple scenes.
+
 Do not explain your reasoning.
 
-IMPORTANT:
-You must always return a non-empty scene description.
+Your response must be complete.
+
+Never stop mid-sentence.
 
 Return only the short scene description.
 """,
 
         user_prompt=idea,
 
-        agent_name="Script Agent"
+        agent_name="Script Agent",
+
+        min_length=60
     )
 
 
@@ -322,6 +397,7 @@ Return only the short scene description.
     # =====================================================
 
     direction = await call_agent(
+
         system_prompt="""
 You are the Director Agent in an AI filmmaking system.
 
@@ -329,6 +405,7 @@ Transform the provided five-second scene into
 professional visual direction.
 
 Specify:
+
 - environment
 - subject appearance
 - lighting
@@ -339,10 +416,12 @@ Specify:
 Preserve the original action.
 
 Do not create another scene.
+
 Do not explain your reasoning.
 
-IMPORTANT:
-You must always return non-empty visual direction.
+Your response must be complete.
+
+Never stop mid-sentence.
 
 Return only the visual direction.
 """,
@@ -355,7 +434,9 @@ SCRIPT:
 {script}
 """,
 
-        agent_name="Director Agent"
+        agent_name="Director Agent",
+
+        min_length=100
     )
 
 
@@ -364,6 +445,7 @@ SCRIPT:
     # =====================================================
 
     camera = await call_agent(
+
         system_prompt="""
 You are the Cinematography Agent in a professional
 AI filmmaking system.
@@ -371,6 +453,7 @@ AI filmmaking system.
 Design the cinematography for the provided scene.
 
 Specify:
+
 - shot type
 - camera angle
 - camera movement
@@ -383,12 +466,14 @@ Everything must be achievable in ONE continuous
 five-second shot.
 
 Do not change the story.
+
 Do not add scene cuts.
+
 Do not explain your reasoning.
 
-IMPORTANT:
-You must always return non-empty cinematography
-instructions.
+Your response must be complete.
+
+Never stop mid-sentence.
 
 Return only the cinematography instructions.
 """,
@@ -404,7 +489,9 @@ DIRECTOR:
 {direction}
 """,
 
-        agent_name="Camera Agent"
+        agent_name="Camera Agent",
+
+        min_length=100
     )
 
 
@@ -413,48 +500,62 @@ DIRECTOR:
     # =====================================================
 
     final_prompt = await call_agent(
+
         system_prompt="""
 You are the final Prompt Engineer for an advanced
 AI text-to-video model.
 
 Combine the supplied script, direction and
-cinematography into ONE production-ready
-English video-generation prompt.
+cinematography into ONE production-ready English
+video-generation prompt.
 
-Requirements:
+The prompt must describe exactly ONE continuous
+five-second shot.
 
-- exactly one continuous five-second shot
-- cinematic 16:9 composition
-- explicit main subject
-- explicit physical action
+Include:
+
+- the main subject
+- the subject's physical action
 - environment
+- composition
+- camera angle
 - camera movement
 - lighting
-- depth
+- depth of field
 - realistic temporal motion
 - coherent physics
 - consistent subject appearance
-- high visual detail
-- professional cinematic quality
+- cinematic visual quality
+
+The final prompt must be detailed enough for a
+text-to-video model to understand the entire shot.
 
 Avoid:
 
 - multiple shots
 - scene cuts
+- dialogue
 - text
 - subtitles
 - logos
 - watermarks
 - duplicated subjects
 - deformed anatomy
-- unnecessary adjectives
 
-IMPORTANT:
-You MUST return a non-empty English video prompt.
+CRITICAL:
 
-Return ONLY the final video prompt.
+Return a COMPLETE final video prompt.
+
+Never return an empty response.
+
+Never return only a fragment.
+
+Never stop mid-sentence.
+
+Return ONLY the final English video prompt.
 
 Do not use headings.
+
 Do not explain your reasoning.
 """,
 
@@ -472,26 +573,33 @@ CAMERA AGENT:
 {camera}
 """,
 
-        agent_name="Prompt Agent"
+        agent_name="Prompt Agent",
+
+        # Much stricter validation for the final prompt.
+        min_length=180
     )
 
 
     # =====================================================
-    # FINAL SAFETY VALIDATION
+    # FINAL PROMPT VALIDATION
     # =====================================================
 
-    if not final_prompt.strip():
+    final_prompt = final_prompt.strip()
+
+
+    if len(final_prompt) < 180:
 
         raise HTTPException(
             status_code=502,
             detail=(
-                "Prompt Agent completed but returned "
-                "an empty final prompt."
+                "Final video prompt did not pass "
+                "quality validation."
             )
         )
 
 
     return {
+
         "success": True,
 
         "idea": idea,
@@ -527,7 +635,9 @@ CAMERA AGENT:
 # VIDEO AGENT — HUGGING FACE ZEROGPU
 # =========================================================
 
-def run_video_generation(prompt: str):
+def run_video_generation(
+    prompt: str
+):
 
     client = Client(
         ZEROGPU_SPACE,
@@ -537,7 +647,6 @@ def run_video_generation(prompt: str):
 
     result = client.predict(
 
-        # Safe/base Wan model.
         model_key="wan-base",
 
         prompt=prompt,
@@ -612,9 +721,6 @@ async def generate_video(
 
     try:
 
-        # Gradio Client is synchronous.
-        # Keep it outside FastAPI's event loop.
-
         result = await asyncio.to_thread(
             run_video_generation,
             prompt
@@ -629,10 +735,13 @@ async def generate_video(
 
 
         # =================================================
-        # EXTRACT VIDEO RESULT
+        # EXTRACT VIDEO
         # =================================================
 
-        if isinstance(result, (list, tuple)):
+        if isinstance(
+            result,
+            (list, tuple)
+        ):
 
             if len(result) == 0:
 
@@ -648,23 +757,34 @@ async def generate_video(
 
 
         # =================================================
-        # EXTRACT LOCAL VIDEO PATH
+        # EXTRACT VIDEO FILE PATH
         # =================================================
 
         video_path = None
 
 
-        if isinstance(video_result, str):
+        if isinstance(
+            video_result,
+            str
+        ):
 
             video_path = video_result
 
 
-        elif isinstance(video_result, dict):
+        elif isinstance(
+            video_result,
+            dict
+        ):
 
-            video_path = video_result.get("path")
+            video_path = video_result.get(
+                "path"
+            )
 
 
-        elif hasattr(video_result, "path"):
+        elif hasattr(
+            video_result,
+            "path"
+        ):
 
             video_path = video_result.path
 
@@ -672,25 +792,33 @@ async def generate_video(
         if not video_path:
 
             raise RuntimeError(
-                "ZeroGPU returned no usable video file path."
+                "ZeroGPU returned no usable "
+                "video file path."
             )
 
 
-        if not os.path.exists(video_path):
+        if not os.path.exists(
+            video_path
+        ):
 
             raise RuntimeError(
-                f"Generated video file was not downloaded: "
-                f"{video_path}"
+                "Generated video file was "
+                f"not downloaded: {video_path}"
             )
 
 
         # =================================================
-        # READ GENERATED MP4
+        # READ MP4
         # =================================================
 
-        with open(video_path, "rb") as video_file:
+        with open(
+            video_path,
+            "rb"
+        ) as video_file:
 
-            video_bytes = video_file.read()
+            video_bytes = (
+                video_file.read()
+            )
 
 
         if not video_bytes:
@@ -701,15 +829,17 @@ async def generate_video(
 
 
         # =================================================
-        # RETURN VIDEO TO FRONTEND
+        # RETURN MP4
         # =================================================
 
         return Response(
+
             content=video_bytes,
 
             media_type="video/mp4",
 
             headers={
+
                 "Content-Disposition":
                     'inline; filename="agentflow-video.mp4"',
 
