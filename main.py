@@ -449,3 +449,28 @@ async def generate_video(
             status_code=500,
             detail=f"Video generation error: {str(e)}"
         )
+
+
+@app.get("/inspect-video-api")
+def inspect_video_api():
+    from gradio_client import Client
+
+    try:
+        client = Client(
+            "numanajmal0/wan-video-api"
+        )
+
+        api_info = client.view_api(
+            return_format="dict"
+        )
+
+        return {
+            "success": True,
+            "api": api_info
+        }
+
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
