@@ -4,3 +4,4 @@ httpx
 python-dotenv
 pydantic
 huggingface_hub
+gradio_client
