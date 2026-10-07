@@ -6,7 +6,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from pydantic import BaseModel
-from huggingface_hub import InferenceClient
+from gradio_client import Client
 
 
 # =========================================================
@@ -15,7 +15,7 @@ from huggingface_hub import InferenceClient
 
 app = FastAPI(
     title="AgentFlow Video API",
-    version="3.0.0"
+    version="4.0.0"
 )
 
 app.add_middleware(
@@ -40,13 +40,9 @@ GROQ_MODEL = os.getenv(
     "openai/gpt-oss-120b"
 )
 
-
 HF_TOKEN = os.getenv("HF_TOKEN")
 
-HF_VIDEO_MODEL = os.getenv(
-    "HF_VIDEO_MODEL",
-    "Wan-AI/Wan2.2-TI2V-5B"
-)
+ZEROGPU_SPACE = "numanajmal0/wan-video-api"
 
 
 # =========================================================
@@ -70,7 +66,8 @@ def home():
     return {
         "status": "online",
         "project": "AgentFlow Video",
-        "version": "3.0.0"
+        "version": "4.0.0",
+        "video_backend": "Hugging Face ZeroGPU"
     }
 
 
@@ -81,7 +78,8 @@ def health():
         "groq_configured": bool(GROQ_API_KEY),
         "huggingface_configured": bool(HF_TOKEN),
         "groq_model": GROQ_MODEL,
-        "video_model": HF_VIDEO_MODEL
+        "video_space": ZEROGPU_SPACE,
+        "video_model": "wan-base"
     }
 
 
@@ -375,22 +373,73 @@ CAMERA AGENT:
 
 
 # =========================================================
-# VIDEO AGENT
+# VIDEO AGENT — HUGGING FACE ZEROGPU
 # =========================================================
 
 def run_video_generation(prompt: str):
 
-    client = InferenceClient(
-        provider="fal-ai",
-        api_key=HF_TOKEN,
-        timeout=300
+    # Connect to the public Hugging Face ZeroGPU Space.
+    #
+    # HF_TOKEN allows the request to use the logged-in
+    # Hugging Face account quota.
+
+    client = Client(
+        ZEROGPU_SPACE,
+        token=HF_TOKEN
     )
 
-    return client.text_to_video(
-        prompt,
-        model=HF_VIDEO_MODEL
+
+    # The parameters below match the REAL /generate
+    # API schema returned by the Space.
+
+    result = client.predict(
+
+        # Use the normal Wan base model.
+        model_key="wan-base",
+
+        # Final prompt produced by our Prompt Agent.
+        prompt=prompt,
+
+        # Things we want the model to avoid.
+        negative_prompt=(
+            "text, subtitles, captions, logos, watermarks, "
+            "low quality, blurry image, JPEG artifacts, "
+            "distorted anatomy, deformed hands, malformed face, "
+            "extra fingers, extra limbs, duplicated subjects, "
+            "static image, frozen motion, flickering, "
+            "inconsistent appearance, inconsistent motion"
+        ),
+
+        # 16:9 landscape video.
+        width=832,
+        height=480,
+
+        # Valid value according to the Space schema (4n+1).
+        num_frames=49,
+
+        # Generation quality settings.
+        steps=30,
+        guidance_scale=5.0,
+
+        # Random seed.
+        seed=-1,
+
+        # Not relevant for wan-base,
+        # but required by the endpoint schema.
+        lora_scale=1.0,
+
+        # No custom checkpoint.
+        custom_ckpt="",
+
+        api_name="/generate"
     )
 
+    return result
+
+
+# =========================================================
+# GENERATE VIDEO ENDPOINT
+# =========================================================
 
 @app.post("/generate-video")
 async def generate_video(
@@ -399,11 +448,13 @@ async def generate_video(
 
     prompt = request.prompt.strip()
 
+
     if not prompt:
         raise HTTPException(
             status_code=400,
             detail="Video prompt cannot be empty."
         )
+
 
     if len(prompt) > 4000:
         raise HTTPException(
@@ -411,66 +462,143 @@ async def generate_video(
             detail="Video prompt is too long."
         )
 
+
     if not HF_TOKEN:
         raise HTTPException(
             status_code=500,
             detail="HF_TOKEN is not configured."
         )
 
+
     try:
 
-        # InferenceClient is synchronous.
+        # gradio_client is synchronous.
         # Run it outside FastAPI's async event loop.
-        video = await asyncio.to_thread(
+
+        result = await asyncio.to_thread(
             run_video_generation,
             prompt
         )
 
-        if not video:
+
+        if not result:
             raise RuntimeError(
-                "The video provider returned an empty response."
+                "ZeroGPU returned an empty result."
             )
 
+
+        # =================================================
+        # READ GRADIO RESPONSE
+        # =================================================
+        #
+        # According to the /generate API schema,
+        # the Space returns:
+        #
+        # 1. Video file
+        # 2. Seed used
+        # 3. Status message
+        #
+        # gradio_client normally returns these as a tuple.
+
+        if isinstance(result, (list, tuple)):
+
+            if len(result) == 0:
+                raise RuntimeError(
+                    "ZeroGPU returned no output."
+                )
+
+            video_result = result[0]
+
+        else:
+
+            # Defensive fallback in case a future
+            # Gradio version returns only the file.
+
+            video_result = result
+
+
+        # =================================================
+        # GET LOCAL VIDEO PATH
+        # =================================================
+
+        video_path = None
+
+
+        # Most common gradio_client response:
+        # a downloaded temporary filepath.
+
+        if isinstance(video_result, str):
+
+            video_path = video_result
+
+
+        # Some Gradio versions may return a dictionary.
+
+        elif isinstance(video_result, dict):
+
+            video_path = video_result.get("path")
+
+
+        # FileData-like object.
+
+        elif hasattr(video_result, "path"):
+
+            video_path = video_result.path
+
+
+        if not video_path:
+
+            raise RuntimeError(
+                "ZeroGPU returned no usable video file path."
+            )
+
+
+        if not os.path.exists(video_path):
+
+            raise RuntimeError(
+                f"Generated video file was not downloaded: {video_path}"
+            )
+
+
+        # =================================================
+        # READ MP4
+        # =================================================
+
+        with open(video_path, "rb") as video_file:
+
+            video_bytes = video_file.read()
+
+
+        if not video_bytes:
+
+            raise RuntimeError(
+                "Generated video file is empty."
+            )
+
+
+        # =================================================
+        # RETURN MP4 TO OUR WEBSITE
+        # =================================================
+
         return Response(
-            content=video,
+            content=video_bytes,
             media_type="video/mp4",
             headers={
                 "Content-Disposition":
-                'inline; filename="agentflow-video.mp4"',
+                    'inline; filename="agentflow-video.mp4"',
 
                 "Cache-Control":
-                "no-store"
+                    "no-store"
             }
         )
+
 
     except Exception as e:
 
         raise HTTPException(
             status_code=500,
-            detail=f"Video generation error: {str(e)}"
+            detail=(
+                "ZeroGPU video generation error: "
+                f"{str(e)}"
+            )
         )
-
-
-@app.get("/inspect-video-api")
-def inspect_video_api():
-    from gradio_client import Client
-
-    try:
-        client = Client(
-            "numanajmal0/wan-video-api"
-        )
-
-        api_info = client.view_api(
-            return_format="dict"
-        )
-
-        return {
-            "success": True,
-            "api": api_info
-        }
-
-    except Exception as e:
-        return {
-            "success": False,
-            "error": str(e)
-        }
